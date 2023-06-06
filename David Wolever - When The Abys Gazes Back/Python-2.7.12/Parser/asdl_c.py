@@ -20,10 +20,7 @@ def get_c_type(name):
     # XXX ack!  need to figure out where Id is useful and where string
     if isinstance(name, asdl.Id):
         name = name.value
-    if name in asdl.builtin_types:
-        return name
-    else:
-        return "%s_ty" % name
+    return name if name in asdl.builtin_types else f"{name}_ty"
 
 def reflow_lines(s, depth):
     """Reflow the line s indented depth tabs.
@@ -73,10 +70,7 @@ def is_simple(sum):
     A sum is simple if its types have no fields, e.g.
     unaryop = Invert | Not | UAdd | USub
     """
-    for t in sum.types:
-        if t.fields:
-            return False
-    return True
+    return not any(t.fields for t in sum.types)
 
 
 class EmitVisitor(asdl.VisitorBase):
@@ -88,10 +82,7 @@ class EmitVisitor(asdl.VisitorBase):
 
     def emit(self, s, depth, reflow=True):
         # XXX reflow long lines?
-        if reflow:
-            lines = reflow_lines(s, depth)
-        else:
-            lines = [s]
+        lines = reflow_lines(s, depth) if reflow else [s]
         for line in lines:
             line = (" " * TABSIZE * depth) + line + "\n"
             self.file.write(line)
@@ -152,6 +143,7 @@ class StructVisitor(EmitVisitor):
     def sum_with_constructors(self, sum, name, depth):
         def emit(s, depth=depth):
             self.emit(s % sys._getframe(1).f_locals, depth)
+
         enum = []
         for i in range(len(sum.types)):
             type = sum.types[i]
@@ -169,7 +161,7 @@ class StructVisitor(EmitVisitor):
             # rudimentary attribute handling
             type = str(field.type)
             assert type in asdl.builtin_types, type
-            emit("%s %s;" % (type, field.name), depth + 1);
+            emit(f"{type} {field.name};", depth + 1);
         emit("};")
         emit("")
 
@@ -180,9 +172,6 @@ class StructVisitor(EmitVisitor):
                 self.visit(f, depth + 1)
             self.emit("} %s;" % cons.name, depth)
             self.emit("", depth)
-        else:
-            # XXX not sure what I want here, nothing is probably fine
-            pass
 
     def visitField(self, field, depth):
         # XXX need to lookup field.type, because it might be something
@@ -216,9 +205,7 @@ class PrototypeVisitor(EmitVisitor):
         self.visit(type.value, type.name)
 
     def visitSum(self, sum, name):
-        if is_simple(sum):
-            pass # XXX
-        else:
+        if not is_simple(sum):
             for t in sum.types:
                 self.visit(t, name, sum.attributes)
 
@@ -240,10 +227,7 @@ class PrototypeVisitor(EmitVisitor):
                 name = f.name
             # XXX should extend get_c_type() to handle this
             if f.seq:
-                if f.type.value in ('cmpop',):
-                    ctype = "asdl_int_seq *"
-                else:
-                    ctype = "asdl_seq *"
+                ctype = "asdl_int_seq *" if f.type.value in ('cmpop',) else "asdl_seq *"
             else:
                 ctype = get_c_type(f.type)
             args.append((ctype, name, f.opt or f.seq))
@@ -258,17 +242,15 @@ class PrototypeVisitor(EmitVisitor):
     def emit_function(self, name, ctype, args, attrs, union=True):
         args = args + attrs
         if args:
-            argstr = ", ".join(["%s %s" % (atype, aname)
-                                for atype, aname, opt in args])
+            argstr = ", ".join([f"{atype} {aname}" for atype, aname, opt in args])
             argstr += ", PyArena *arena"
         else:
             argstr = "PyArena *arena"
         margs = "a0"
         for i in range(1, len(args)+1):
             margs += ", a%d" % i
-        self.emit("#define %s(%s) _Py_%s(%s)" % (name, margs, name, margs), 0,
-                reflow=False)
-        self.emit("%s _Py_%s(%s);" % (ctype, name, argstr), False)
+        self.emit(f"#define {name}({margs}) _Py_{name}({margs})", 0, reflow=False)
+        self.emit(f"{ctype} _Py_{name}({argstr});", False)
 
     def visitProduct(self, prod, name):
         self.emit_function(name, get_c_type(name),
@@ -281,28 +263,27 @@ class FunctionVisitor(PrototypeVisitor):
     def emit_function(self, name, ctype, args, attrs, union=True):
         def emit(s, depth=0, reflow=True):
             self.emit(s, depth, reflow)
-        argstr = ", ".join(["%s %s" % (atype, aname)
-                            for atype, aname, opt in args + attrs])
+
+        argstr = ", ".join([f"{atype} {aname}" for atype, aname, opt in args + attrs])
         if argstr:
             argstr += ", PyArena *arena"
         else:
             argstr = "PyArena *arena"
-        self.emit("%s" % ctype, 0)
-        emit("%s(%s)" % (name, argstr))
+        self.emit(f"{ctype}", 0)
+        emit(f"{name}({argstr})")
         emit("{")
-        emit("%s p;" % ctype, 1)
+        emit(f"{ctype} p;", 1)
         for argtype, argname, opt in args:
             # XXX hack alert: false is allowed for a bool
-            if not opt and not (argtype == "bool" or argtype == "int"):
+            if not opt and argtype not in ["bool", "int"]:
                 emit("if (!%s) {" % argname, 1)
                 emit("PyErr_SetString(PyExc_ValueError,", 2)
-                msg = "field %s is required for %s" % (argname, name)
-                emit('                "%s");' % msg,
-                     2, reflow=False)
+                msg = f"field {argname} is required for {name}"
+                emit(f'                "{msg}");', 2, reflow=False)
                 emit('return NULL;', 2)
                 emit('}', 1)
 
-        emit("p = (%s)PyArena_Malloc(arena, sizeof(*p));" % ctype, 1);
+        emit(f"p = ({ctype})PyArena_Malloc(arena, sizeof(*p));", 1);
         emit("if (!p)", 1)
         emit("return NULL;", 2)
         if union:
@@ -316,17 +297,19 @@ class FunctionVisitor(PrototypeVisitor):
     def emit_body_union(self, name, args, attrs):
         def emit(s, depth=0, reflow=True):
             self.emit(s, depth, reflow)
-        emit("p->kind = %s_kind;" % name, 1)
+
+        emit(f"p->kind = {name}_kind;", 1)
         for argtype, argname, opt in args:
-            emit("p->v.%s.%s = %s;" % (name, argname, argname), 1)
+            emit(f"p->v.{name}.{argname} = {argname};", 1)
         for argtype, argname, opt in attrs:
-            emit("p->%s = %s;" % (argname, argname), 1)
+            emit(f"p->{argname} = {argname};", 1)
 
     def emit_body_struct(self, name, args, attrs):
         def emit(s, depth=0, reflow=True):
             self.emit(s, depth, reflow)
+
         for argtype, argname, opt in args:
-            emit("p->%s = %s;" % (argname, argname), 1)
+            emit(f"p->{argname} = {argname};", 1)
         assert not attrs
 
 
@@ -364,7 +347,7 @@ class Obj2ModVisitor(PickleVisitor):
     def funcHeader(self, name):
         ctype = get_c_type(name)
         self.emit("int", 0)
-        self.emit("obj2ast_%s(PyObject* obj, %s* out, PyArena* arena)" % (name, ctype), 0)
+        self.emit(f"obj2ast_{name}(PyObject* obj, {ctype}* out, PyArena* arena)", 0)
         self.emit("{", 0)
         self.emit("PyObject* tmp = NULL;", 1)
         self.emit("int isinstance;", 1)
@@ -386,15 +369,15 @@ class Obj2ModVisitor(PickleVisitor):
 
     def simpleSum(self, sum, name):
         self.funcHeader(name)
+        line = ("isinstance = PyObject_IsInstance(obj, "
+                "(PyObject *)%s_type);")
         for t in sum.types:
-            line = ("isinstance = PyObject_IsInstance(obj, "
-                    "(PyObject *)%s_type);")
             self.emit(line % (t.name,), 1)
             self.emit("if (isinstance == -1) {", 1)
             self.emit("return 1;", 2)
             self.emit("}", 1)
             self.emit("if (isinstance) {", 1)
-            self.emit("*out = %s;" % t.name, 2)
+            self.emit(f"*out = {t.name};", 2)
             self.emit("return 0;", 2)
             self.emit("}", 1)
         self.sumTrailer(name)
@@ -414,8 +397,8 @@ class Obj2ModVisitor(PickleVisitor):
         self.emit("}", 1)
         for a in sum.attributes:
             self.visitField(a, name, sum=sum, depth=1)
+        line = "isinstance = PyObject_IsInstance(obj, (PyObject*)%s_type);"
         for t in sum.types:
-            line = "isinstance = PyObject_IsInstance(obj, (PyObject*)%s_type);"
             self.emit(line % (t.name,), 1)
             self.emit("if (isinstance == -1) {", 1)
             self.emit("return 1;", 2)
@@ -427,7 +410,7 @@ class Obj2ModVisitor(PickleVisitor):
             for f in t.fields:
                 self.visitField(f, t.name, sum=sum, depth=2)
             args = [f.name.value for f in t.fields] + [a.name.value for a in sum.attributes]
-            self.emit("*out = %s(%s);" % (t.name, self.buildArgs(args)), 2)
+            self.emit(f"*out = {t.name}({self.buildArgs(args)});", 2)
             self.emit("if (*out == NULL) goto failed;", 2)
             self.emit("return 0;", 2)
             self.emit("}", 1)
@@ -435,7 +418,7 @@ class Obj2ModVisitor(PickleVisitor):
 
     def visitAttributeDeclaration(self, a, name, sum=sum):
         ctype = get_c_type(a.type)
-        self.emit("%s %s;" % (ctype, a.name), 1)
+        self.emit(f"{ctype} {a.name};", 1)
 
     def visitSum(self, sum, name):
         if is_simple(sum):
@@ -446,7 +429,7 @@ class Obj2ModVisitor(PickleVisitor):
     def visitProduct(self, prod, name):
         ctype = get_c_type(name)
         self.emit("int", 0)
-        self.emit("obj2ast_%s(PyObject* obj, %s* out, PyArena* arena)" % (name, ctype), 0)
+        self.emit(f"obj2ast_{name}(PyObject* obj, {ctype}* out, PyArena* arena)", 0)
         self.emit("{", 0)
         self.emit("PyObject* tmp = NULL;", 1)
         for f in prod.fields:
@@ -455,7 +438,7 @@ class Obj2ModVisitor(PickleVisitor):
         for f in prod.fields:
             self.visitField(f, name, prod=prod, depth=1)
         args = [f.name.value for f in prod.fields]
-        self.emit("*out = %s(%s);" % (name, self.buildArgs(args)), 1)
+        self.emit(f"*out = {name}({self.buildArgs(args)});", 1)
         self.emit("return 0;", 1)
         self.emit("failed:", 0)
         self.emit("Py_XDECREF(tmp);", 1)
@@ -467,12 +450,12 @@ class Obj2ModVisitor(PickleVisitor):
         ctype = get_c_type(field.type)
         if field.seq:
             if self.isSimpleType(field):
-                self.emit("asdl_int_seq* %s;" % field.name, depth)
+                self.emit(f"asdl_int_seq* {field.name};", depth)
             else:
-                self.emit("asdl_seq* %s;" % field.name, depth)
+                self.emit(f"asdl_seq* {field.name};", depth)
         else:
             ctype = get_c_type(field.type)
-            self.emit("%s %s;" % (ctype, field.name), depth)
+            self.emit(f"{ctype} {field.name};", depth)
 
     def isSimpleSum(self, field):
         # XXX can the members of this list be determined automatically?
@@ -504,20 +487,22 @@ class Obj2ModVisitor(PickleVisitor):
             self.emit("}", depth+1)
             self.emit("len = PyList_GET_SIZE(tmp);", depth+1)
             if self.isSimpleType(field):
-                self.emit("%s = asdl_int_seq_new(len, arena);" % field.name, depth+1)
+                self.emit(f"{field.name} = asdl_int_seq_new(len, arena);", depth+1)
             else:
-                self.emit("%s = asdl_seq_new(len, arena);" % field.name, depth+1)
-            self.emit("if (%s == NULL) goto failed;" % field.name, depth+1)
+                self.emit(f"{field.name} = asdl_seq_new(len, arena);", depth+1)
+            self.emit(f"if ({field.name} == NULL) goto failed;", depth+1)
             self.emit("for (i = 0; i < len; i++) {", depth+1)
-            self.emit("%s value;" % ctype, depth+2)
-            self.emit("res = obj2ast_%s(PyList_GET_ITEM(tmp, i), &value, arena);" %
-                      field.type, depth+2, reflow=False)
+            self.emit(f"{ctype} value;", depth+2)
+            self.emit(
+                f"res = obj2ast_{field.type}(PyList_GET_ITEM(tmp, i), &value, arena);",
+                depth + 2,
+                reflow=False,
+            )
             self.emit("if (res != 0) goto failed;", depth+2)
-            self.emit("asdl_seq_SET(%s, i, value);" % field.name, depth+2)
+            self.emit(f"asdl_seq_SET({field.name}, i, value);", depth+2)
             self.emit("}", depth+1)
         else:
-            self.emit("res = obj2ast_%s(tmp, &%s, arena);" %
-                      (field.type, field.name), depth+1)
+            self.emit(f"res = obj2ast_{field.type}(tmp, &{field.name}, arena);", depth+1)
             self.emit("if (res != 0) goto failed;", depth+1)
 
         self.emit("Py_XDECREF(tmp);", depth+1)
@@ -528,13 +513,12 @@ class Obj2ModVisitor(PickleVisitor):
             format = "PyErr_SetString(PyExc_TypeError, \"%s\");"
             self.emit(format % message, depth+1, reflow=False)
             self.emit("return 1;", depth+1)
+        elif self.isNumeric(field):
+            self.emit(f"{field.name} = 0;", depth+1)
+        elif not self.isSimpleType(field):
+            self.emit(f"{field.name} = NULL;", depth+1)
         else:
-            if self.isNumeric(field):
-                self.emit("%s = 0;" % field.name, depth+1)
-            elif not self.isSimpleType(field):
-                self.emit("%s = NULL;" % field.name, depth+1)
-            else:
-                raise TypeError("could not determine the default value for %s" % field.name)
+            raise TypeError(f"could not determine the default value for {field.name}")
         self.emit("}", depth)
 
 
@@ -542,8 +526,7 @@ class MarshalPrototypeVisitor(PickleVisitor):
 
     def prototype(self, sum, name):
         ctype = get_c_type(name)
-        self.emit("static int marshal_write_%s(PyObject **, int *, %s);"
-                  % (name, ctype), 0)
+        self.emit(f"static int marshal_write_{name}(PyObject **, int *, {ctype});", 0)
 
     visitProduct = visitSum = prototype
 
@@ -551,39 +534,37 @@ class MarshalPrototypeVisitor(PickleVisitor):
 class PyTypesDeclareVisitor(PickleVisitor):
 
     def visitProduct(self, prod, name):
-        self.emit("static PyTypeObject *%s_type;" % name, 0)
-        self.emit("static PyObject* ast2obj_%s(void*);" % name, 0)
+        self.emit(f"static PyTypeObject *{name}_type;", 0)
+        self.emit(f"static PyObject* ast2obj_{name}(void*);", 0)
         if prod.fields:
             self.emit("static char *%s_fields[]={" % name,0)
             for f in prod.fields:
-                self.emit('"%s",' % f.name, 1)
+                self.emit(f'"{f.name}",', 1)
             self.emit("};", 0)
 
     def visitSum(self, sum, name):
-        self.emit("static PyTypeObject *%s_type;" % name, 0)
+        self.emit(f"static PyTypeObject *{name}_type;", 0)
         if sum.attributes:
             self.emit("static char *%s_attributes[] = {" % name, 0)
             for a in sum.attributes:
-                self.emit('"%s",' % a.name, 1)
+                self.emit(f'"{a.name}",', 1)
             self.emit("};", 0)
         ptype = "void*"
         if is_simple(sum):
             ptype = get_c_type(name)
-            tnames = []
-            for t in sum.types:
-                tnames.append(str(t.name)+"_singleton")
+            tnames = [f"{str(t.name)}_singleton" for t in sum.types]
             tnames = ", *".join(tnames)
-            self.emit("static PyObject *%s;" % tnames, 0)
-        self.emit("static PyObject* ast2obj_%s(%s);" % (name, ptype), 0)
+            self.emit(f"static PyObject *{tnames};", 0)
+        self.emit(f"static PyObject* ast2obj_{name}({ptype});", 0)
         for t in sum.types:
             self.visitConstructor(t, name)
 
     def visitConstructor(self, cons, name):
-        self.emit("static PyTypeObject *%s_type;" % cons.name, 0)
+        self.emit(f"static PyTypeObject *{cons.name}_type;", 0)
         if cons.fields:
             self.emit("static char *%s_fields[]={" % cons.name, 0)
             for t in cons.fields:
-                self.emit('"%s",' % t.name, 1)
+                self.emit(f'"{t.name}",', 1)
             self.emit("};",0)
 
 class PyTypesVisitor(PickleVisitor):
@@ -885,39 +866,34 @@ static int add_ast_fields(void)
         self.emit("}", 0)
 
     def visitProduct(self, prod, name):
-        if prod.fields:
-            fields = name.value+"_fields"
-        else:
-            fields = "NULL"
+        fields = f"{name.value}_fields" if prod.fields else "NULL"
         self.emit('%s_type = make_type("%s", &AST_type, %s, %d);' %
                         (name, name, fields, len(prod.fields)), 1)
-        self.emit("if (!%s_type) return 0;" % name, 1)
+        self.emit(f"if (!{name}_type) return 0;", 1)
 
     def visitSum(self, sum, name):
-        self.emit('%s_type = make_type("%s", &AST_type, NULL, 0);' %
-                  (name, name), 1)
-        self.emit("if (!%s_type) return 0;" % name, 1)
+        self.emit(f'{name}_type = make_type("{name}", &AST_type, NULL, 0);', 1)
+        self.emit(f"if (!{name}_type) return 0;", 1)
         if sum.attributes:
             self.emit("if (!add_attributes(%s_type, %s_attributes, %d)) return 0;" %
                             (name, name, len(sum.attributes)), 1)
         else:
-            self.emit("if (!add_attributes(%s_type, NULL, 0)) return 0;" % name, 1)
+            self.emit(f"if (!add_attributes({name}_type, NULL, 0)) return 0;", 1)
         simple = is_simple(sum)
         for t in sum.types:
             self.visitConstructor(t, name, simple)
 
     def visitConstructor(self, cons, name, simple):
-        if cons.fields:
-            fields = cons.name.value+"_fields"
-        else:
-            fields = "NULL"
+        fields = f"{cons.name.value}_fields" if cons.fields else "NULL"
         self.emit('%s_type = make_type("%s", %s_type, %s, %d);' %
                             (cons.name, cons.name, name, fields, len(cons.fields)), 1)
-        self.emit("if (!%s_type) return 0;" % cons.name, 1)
+        self.emit(f"if (!{cons.name}_type) return 0;", 1)
         if simple:
-            self.emit("%s_singleton = PyType_GenericNew(%s_type, NULL, NULL);" %
-                             (cons.name, cons.name), 1)
-            self.emit("if (!%s_singleton) return 0;" % cons.name, 1)
+            self.emit(
+                f"{cons.name}_singleton = PyType_GenericNew({cons.name}_type, NULL, NULL);",
+                1,
+            )
+            self.emit(f"if (!{cons.name}_singleton) return 0;", 1)
 
 
 class ASTModuleVisitor(PickleVisitor):
@@ -935,8 +911,10 @@ class ASTModuleVisitor(PickleVisitor):
         self.emit('if (PyModule_AddIntConstant(m, "PyCF_ONLY_AST", PyCF_ONLY_AST) < 0)', 1)
         self.emit("return;", 2)
         # Value of version: "$Revision$"
-        self.emit('if (PyModule_AddStringConstant(m, "__version__", "%s") < 0)'
-                % mod.version, 1)
+        self.emit(
+            f'if (PyModule_AddStringConstant(m, "__version__", "{mod.version}") < 0)',
+            1,
+        )
         self.emit("return;", 2)
         for dfn in mod.dfns:
             self.visit(dfn)
@@ -954,7 +932,10 @@ class ASTModuleVisitor(PickleVisitor):
         self.addObj(cons.name)
 
     def addObj(self, name):
-        self.emit('if (PyDict_SetItemString(d, "%s", (PyObject*)%s_type) < 0) return;' % (name, name), 1)
+        self.emit(
+            f'if (PyDict_SetItemString(d, "{name}", (PyObject*){name}_type) < 0) return;',
+            1,
+        )
 
 
 _SPECIALIZED_SEQUENCES = ('stmt', 'expr')
@@ -970,10 +951,7 @@ def find_sequence(fields, doing_specialization):
     return False
 
 def has_sequence(types, doing_specialization):
-    for t in types:
-        if find_sequence(t.fields, doing_specialization):
-            return True
-    return False
+    return any(find_sequence(t.fields, doing_specialization) for t in types)
 
 
 class StaticVisitor(PickleVisitor):
@@ -988,9 +966,9 @@ class ObjVisitor(PickleVisitor):
     def func_begin(self, name):
         ctype = get_c_type(name)
         self.emit("PyObject*", 0)
-        self.emit("ast2obj_%s(void* _o)" % (name), 0)
+        self.emit(f"ast2obj_{name}(void* _o)", 0)
         self.emit("{", 0)
-        self.emit("%s o = (%s)_o;" % (ctype, ctype), 1)
+        self.emit(f"{ctype} o = ({ctype})_o;", 1)
         self.emit("PyObject *result = NULL, *value = NULL;", 1)
         self.emit('if (!o) {', 1)
         self.emit("Py_INCREF(Py_None);", 2)
@@ -1018,21 +996,21 @@ class ObjVisitor(PickleVisitor):
             self.visitConstructor(t, i + 1, name)
         self.emit("}", 1)
         for a in sum.attributes:
-            self.emit("value = ast2obj_%s(o->%s);" % (a.type, a.name), 1)
+            self.emit(f"value = ast2obj_{a.type}(o->{a.name});", 1)
             self.emit("if (!value) goto failed;", 1)
-            self.emit('if (PyObject_SetAttrString(result, "%s", value) < 0)' % a.name, 1)
+            self.emit(f'if (PyObject_SetAttrString(result, "{a.name}", value) < 0)', 1)
             self.emit('goto failed;', 2)
             self.emit('Py_DECREF(value);', 1)
         self.func_end()
 
     def simpleSum(self, sum, name):
-        self.emit("PyObject* ast2obj_%s(%s_ty o)" % (name, name), 0)
+        self.emit(f"PyObject* ast2obj_{name}({name}_ty o)", 0)
         self.emit("{", 0)
         self.emit("switch(o) {", 1)
         for t in sum.types:
-            self.emit("case %s:" % t.name, 2)
-            self.emit("Py_INCREF(%s_singleton);" % t.name, 3)
-            self.emit("return %s_singleton;" % t.name, 3)
+            self.emit(f"case {t.name}:", 2)
+            self.emit(f"Py_INCREF({t.name}_singleton);", 3)
+            self.emit(f"return {t.name}_singleton;", 3)
         self.emit("default:", 2)
         self.emit('/* should never happen, but just in case ... */', 3)
         code = "PyErr_Format(PyExc_SystemError, \"unknown %s found\");" % name
@@ -1043,15 +1021,15 @@ class ObjVisitor(PickleVisitor):
 
     def visitProduct(self, prod, name):
         self.func_begin(name)
-        self.emit("result = PyType_GenericNew(%s_type, NULL, NULL);" % name, 1);
+        self.emit(f"result = PyType_GenericNew({name}_type, NULL, NULL);", 1);
         self.emit("if (!result) return NULL;", 1)
         for field in prod.fields:
             self.visitField(field, name, 1, True)
         self.func_end()
 
     def visitConstructor(self, cons, enum, name):
-        self.emit("case %s_kind:" % cons.name, 1)
-        self.emit("result = PyType_GenericNew(%s_type, NULL, NULL);" % cons.name, 2);
+        self.emit(f"case {cons.name}_kind:", 1)
+        self.emit(f"result = PyType_GenericNew({cons.name}_type, NULL, NULL);", 2);
         self.emit("if (!result) goto failed;", 2)
         for f in cons.fields:
             self.visitField(f, cons.name, 2, False)
@@ -1060,18 +1038,16 @@ class ObjVisitor(PickleVisitor):
     def visitField(self, field, name, depth, product):
         def emit(s, d):
             self.emit(s, depth + d)
-        if product:
-            value = "o->%s" % field.name
-        else:
-            value = "o->v.%s.%s" % (name, field.name)
+
+        value = f"o->{field.name}" if product else f"o->v.{name}.{field.name}"
         self.set(field, value, depth)
         emit("if (!value) goto failed;", 0)
-        emit('if (PyObject_SetAttrString(result, "%s", value) == -1)' % field.name, 0)
+        emit(f'if (PyObject_SetAttrString(result, "{field.name}", value) == -1)', 0)
         emit("goto failed;", 1)
         emit("Py_DECREF(value);", 0)
 
     def emitSeq(self, field, value, depth, emit):
-        emit("seq = %s;" % value, 0)
+        emit(f"seq = {value};", 0)
         emit("n = asdl_seq_LEN(seq);", 0)
         emit("value = PyList_New(n);", 0)
         emit("if (!value) goto failed;", 0)
@@ -1089,19 +1065,22 @@ class ObjVisitor(PickleVisitor):
                 # While the sequence elements are stored as void*,
                 # ast2obj_cmpop expects an enum
                 self.emit("{", depth)
-                self.emit("int i, n = asdl_seq_LEN(%s);" % value, depth+1)
+                self.emit(f"int i, n = asdl_seq_LEN({value});", depth+1)
                 self.emit("value = PyList_New(n);", depth+1)
                 self.emit("if (!value) goto failed;", depth+1)
                 self.emit("for(i = 0; i < n; i++)", depth+1)
                 # This cannot fail, so no need for error handling
-                self.emit("PyList_SET_ITEM(value, i, ast2obj_cmpop((cmpop_ty)asdl_seq_GET(%s, i)));" % value,
-                          depth+2, reflow=False)
+                self.emit(
+                    f"PyList_SET_ITEM(value, i, ast2obj_cmpop((cmpop_ty)asdl_seq_GET({value}, i)));",
+                    depth + 2,
+                    reflow=False,
+                )
                 self.emit("}", depth)
             else:
-                self.emit("value = ast2obj_list(%s, ast2obj_%s);" % (value, field.type), depth)
+                self.emit(f"value = ast2obj_list({value}, ast2obj_{field.type});", depth)
         else:
             ctype = get_c_type(field.type)
-            self.emit("value = ast2obj_%s(%s);" % (field.type, value), depth, reflow=False)
+            self.emit(f"value = ast2obj_{field.type}({value});", depth, reflow=False)
 
 
 class PartingShots(StaticVisitor):
@@ -1186,41 +1165,38 @@ def main(srcfile):
     if not asdl.check(mod):
         sys.exit(1)
     if INC_DIR:
-        p = "%s/%s-ast.h" % (INC_DIR, mod.name)
-        f = open(p, "wb")
-        f.write(auto_gen_msg)
-        f.write('#include "asdl.h"\n\n')
-        c = ChainOfVisitors(TypeDefVisitor(f),
-                            StructVisitor(f),
-                            PrototypeVisitor(f),
-                            )
-        c.visit(mod)
-        f.write("PyObject* PyAST_mod2obj(mod_ty t);\n")
-        f.write("mod_ty PyAST_obj2mod(PyObject* ast, PyArena* arena, int mode);\n")
-        f.write("int PyAST_Check(PyObject* obj);\n")
-        f.close()
-
+        p = f"{INC_DIR}/{mod.name}-ast.h"
+        with open(p, "wb") as f:
+            f.write(auto_gen_msg)
+            f.write('#include "asdl.h"\n\n')
+            c = ChainOfVisitors(TypeDefVisitor(f),
+                                StructVisitor(f),
+                                PrototypeVisitor(f),
+                                )
+            c.visit(mod)
+            f.write("PyObject* PyAST_mod2obj(mod_ty t);\n")
+            f.write("mod_ty PyAST_obj2mod(PyObject* ast, PyArena* arena, int mode);\n")
+            f.write("int PyAST_Check(PyObject* obj);\n")
     if SRC_DIR:
-        p = os.path.join(SRC_DIR, str(mod.name) + "-ast.c")
-        f = open(p, "wb")
-        f.write(auto_gen_msg)
-        f.write(c_file_msg % mod.version)
-        f.write('#include "Python.h"\n')
-        f.write('#include "%s-ast.h"\n' % mod.name)
-        f.write('\n')
-        f.write("static PyTypeObject AST_type;\n")
-        v = ChainOfVisitors(
-            PyTypesDeclareVisitor(f),
-            PyTypesVisitor(f),
-            Obj2ModPrototypeVisitor(f),
-            FunctionVisitor(f),
-            ObjVisitor(f),
-            Obj2ModVisitor(f),
-            ASTModuleVisitor(f),
-            PartingShots(f),
-            )
-        v.visit(mod)
-        f.close()
+        p = os.path.join(SRC_DIR, f"{str(mod.name)}-ast.c")
+        with open(p, "wb") as f:
+            f.write(auto_gen_msg)
+            f.write(c_file_msg % mod.version)
+            f.write('#include "Python.h"\n')
+            f.write('#include "%s-ast.h"\n' % mod.name)
+            f.write('\n')
+            f.write("static PyTypeObject AST_type;\n")
+            v = ChainOfVisitors(
+                PyTypesDeclareVisitor(f),
+                PyTypesVisitor(f),
+                Obj2ModPrototypeVisitor(f),
+                FunctionVisitor(f),
+                ObjVisitor(f),
+                Obj2ModVisitor(f),
+                ASTModuleVisitor(f),
+                PartingShots(f),
+                )
+            v.visit(mod)
 
 if __name__ == "__main__":
     import sys

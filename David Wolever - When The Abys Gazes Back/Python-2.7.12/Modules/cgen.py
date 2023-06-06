@@ -59,10 +59,7 @@ def getnum(s):
 # Function to check if a string is a number
 #
 def isnum(s):
-    if not s: return False
-    for c in s:
-        if not c in digits: return False
-    return True
+    return False if not s else all(c in digits for c in s)
 
 
 # Allowed function return types
@@ -411,8 +408,8 @@ def generate(type, func, database):
 def mkobject(type, arg):
     if type[:9] == 'unsigned ':
         type = type[9:]
-        return 'mknew' + type + 'object((' + type + ') ' + arg + ')'
-    return 'mknew' + type + 'object(' + arg + ')'
+        return f'mknew{type}object(({type}) {arg})'
+    return f'mknew{type}object({arg})'
 
 
 defined_archs = []

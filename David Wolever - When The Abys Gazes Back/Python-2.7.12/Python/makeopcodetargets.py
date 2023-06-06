@@ -25,19 +25,16 @@ def write_contents(f):
     for opname, op in opcode.opmap.items():
         if opname == "STOP_CODE":
             continue
-        targets[op] = "TARGET_%s" % opname.replace("+0", " ").replace("+", "_")
+        targets[op] = f'TARGET_{opname.replace("+0", " ").replace("+", "_")}'
     f.write("static void *opcode_targets[256] = {\n")
-    f.write(",\n".join(["    &&%s" % s for s in targets]))
+    f.write(",\n".join([f"    &&{s}" for s in targets]))
     f.write("\n};\n")
 
 
 if __name__ == "__main__":
     import sys
     assert len(sys.argv) < 3, "Too many arguments"
-    if len(sys.argv) == 2:
-        target = sys.argv[1]
-    else:
-        target = "Python/opcode_targets.h"
+    target = sys.argv[1] if len(sys.argv) == 2 else "Python/opcode_targets.h"
     f = open(target, "w")
     try:
         write_contents(f)
